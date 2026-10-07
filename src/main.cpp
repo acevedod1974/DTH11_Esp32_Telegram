@@ -5,43 +5,60 @@
  * SERVICIOS: Telegram Bot API + CallMeBot (WhatsApp API)
  * PERIFÉRICOS:
  *   - Sensor: DHT11 (Temperatura / Humedad) vía GPIO 32
- *   - Pantalla: LCD 1602 con expansor I2C (PCF8574) vía GPIO 21 (SDA) y GPIO 22 (SCL)
+ *   - Pantalla Activa: OLED 0.96" 128x64 I2C (SSD1306) vía GPIO 21 (SDA) y GPIO 22 (SCL)
+ *   - Pantalla Inactiva (Backup): LCD 1602 con PCF8574 (Código preservado en comentarios)
  * ============================================================================
  *
  * DESCRIPCIÓN:
- * Firmware para el monitoreo continuo de variables termohigrométricas mediante
- * sensor DHT11 y despliegue local en pantalla LCD 1602 I2C. Incorpora una lógica
- * de disparo de alarmas ante sobretemperatura (TEMP_LIMIT) con histéresis de
- * apagado/rearme (TEMP_RESET). Las notificaciones remotas se transmiten de forma
- * secuencial a través de la API de Bots de Telegram y el gateway CallMeBot (WhatsApp).
+ * Firmware para el monitoreo continuo de magnitudes termohigrométricas mediante
+ * sensor DHT11 y despliegue gráfico local en pantalla OLED monocromática de 0.96"
+ * (controlador SSD1306, 128x64 px). Incorpora máquina de estados para disparo
+ * secuencial de alertas hacia Telegram y WhatsApp con histéresis de seguridad.
  *
- * Para prevenir retardos en la respuesta del bus I2C y saturación de las APIs
- * remotas, el bucle principal opera bajo una arquitectura de temporización
- * concurrente y no bloqueante basada exclusivamente en la función millis().
+ * Toda la arquitectura de temporización y refresco de pantalla opera bajo un
+ * esquema no bloqueante con millis() para no interferir con las tareas del ESP32.
  * ============================================================================
  */
 
 // Inclusión de librerías esenciales del core de ESP32 y periféricos
 #include <Arduino.h>
-#include <WiFi.h>              // Gestión del stack TCP/IP y conectividad Wi-Fi STA
-#include <WiFiClientSecure.h>  // Cliente TLS/SSL para conexiones cifradas HTTPS
-#include <HTTPClient.h>        // Manejador simplificado de peticiones cliente HTTP/HTTPS
-#include <UrlEncode.h>         // Codificación de caracteres especiales según RFC 3986
-#include <DHT.h>               // Librería Adafruit para adquisición de datos DHT
-#include <Wire.h>              // Driver del bus serie síncrono I2C (Two-Wire Interface)
-#include <LiquidCrystal_I2C.h> // Controlador para pantallas LCD basadas en HD44780 + PCF8574
-#include "secrets.h"           // Credenciales de red (SSID/PASS) y tokens privados
+#include <WiFi.h>             // Gestión del stack TCP/IP y conectividad Wi-Fi STA
+#include <WiFiClientSecure.h> // Cliente TLS/SSL para conexiones cifradas HTTPS
+#include <HTTPClient.h>       // Manejador simplificado de peticiones cliente HTTP/HTTPS
+#include <UrlEncode.h>        // Codificación de caracteres especiales según RFC 3986
+#include <DHT.h>              // Librería Adafruit para adquisición de datos DHT
+#include <Wire.h>             // Driver del bus serie síncrono I2C (Two-Wire Interface)
+
+// Librerías de la pantalla OLED activa (SSD1306)
+#include <Adafruit_GFX.h>     // Primitivas gráficas del ecosistema Adafruit
+#include <Adafruit_SSD1306.h> // Controlador de hardware para paneles OLED SSD1306
+
+/* ============================================================================
+   LIBRERÍA DESACTIVADA: PANTALLA LCD 1602 I2C
+   ============================================================================ */
+// #include <LiquidCrystal_I2C.h> // Controlador para pantallas LCD basadas en HD44780 + PCF8574
+
+#include "secrets.h" // Credenciales de red (SSID/PASS) y tokens privados
 
 // ============================================================================
 // DEFINICIONES DE HARDWARE Y ASIGNACIÓN DE PINES (GPIO)
 // ============================================================================
-#define DHTPIN 32         // Pin GPIO asignado al bus digital 1-Wire del DHT11
-#define DHTTYPE DHT11     // Transductor específico seleccionado
-#define I2C_SDA_PIN 21    // Pin GPIO asignado a la línea de datos serie I2C
-#define I2C_SCL_PIN 22    // Pin GPIO asignado a la línea de reloj serie I2C
-#define LCD_I2C_ADDR 0x27 // Dirección física del módulo expansor PCF8574 (típicamente 0x27 o 0x3F)
+#define DHTPIN 32      // Pin GPIO asignado al bus digital 1-Wire del DHT11
+#define DHTTYPE DHT11  // Transductor específico seleccionado
+#define I2C_SDA_PIN 21 // Pin GPIO asignado a la línea de datos serie I2C
+#define I2C_SCL_PIN 22 // Pin GPIO asignado a la línea de reloj serie I2C
+
+// --- Configuración OLED Activa ---
+#define SCREEN_WIDTH 128   // Ancho del panel OLED en píxeles
+#define SCREEN_HEIGHT 64   // Alto del panel OLED en píxeles
+#define OLED_RESET -1      // Reset compartido con el ESP32 (-1 indica que no hay pin dedicado)
+#define OLED_I2C_ADDR 0x3C // Dirección I2C de 7 bits (0x78 en escritura de 8 bits equivale a 0x3C)
+
+/* --- Configuración LCD 1602 Desactivada ---
+#define LCD_I2C_ADDR 0x27 // Dirección física del módulo expansor PCF8574
 #define LCD_COLUMNS 16    // Capacidad horizontal del display (caracteres)
 #define LCD_ROWS 2        // Capacidad vertical del display (líneas)
+*/
 
 // ============================================================================
 // PARÁMETROS OPERATIVOS Y CONTROL DE TIEMPOS (MILLIS)
@@ -50,8 +67,8 @@
 #define TEMP_RESET (TEMP_LIMIT - 1) // Umbral inferior con histéresis de 1 °C para rearme
 #define COOLDOWN_MS 15000           // Ventana de enfriamiento entre reintentos de notificación remota
 #define WIFI_RETRY_MS 10000         // Intervalo de comprobación e intento de reconexión Wi-Fi
-#define SENSOR_INTERVAL_MS 2000     // Período de muestreo del sensor DHT11 (limitación física: >= 1-2 s)
-#define LCD_INTERVAL_MS 1000        // Cadencia de refresco del búfer de la pantalla LCD
+#define SENSOR_INTERVAL_MS 2000     // Período de muestreo del sensor DHT11 (físicamente >= 1-2 s)
+#define DISPLAY_INTERVAL_MS 1000    // Cadencia de refresco visual en la pantalla OLED
 
 // ============================================================================
 // PARÁMETROS DEL SERVICIO TELEGRAM BOT API
@@ -62,15 +79,19 @@ const int httpsPort = 443;                     // Puerto estándar para transpor
 // ============================================================================
 // INSTANCIACIÓN DE OBJETOS GLOBALES Y VARIABLES DE ESTADO
 // ============================================================================
-DHT dht(DHTPIN, DHTTYPE);                                   // Instancia del transductor DHT11
-LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS); // Instancia del display LCD 1602 vía I2C
-WiFiClientSecure secureClient;                              // Cliente TLS/SSL reutilizable para peticiones seguras
+DHT dht(DHTPIN, DHTTYPE);                                                 // Instancia del transductor DHT11
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // Instancia del panel OLED SSD1306
+WiFiClientSecure secureClient;                                            // Cliente TLS/SSL reutilizable para peticiones seguras
+
+/* --- Instancia LCD 1602 Desactivada ---
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
+*/
 
 // Timers para la gestión no bloqueante de tareas
-unsigned long lastWifiAttempt = 0;  // Marca de tiempo del último intento de enlace Wi-Fi
-unsigned long lastAlertAttempt = 0; // Marca de tiempo del último despacho de notificación remota
-unsigned long lastSensorRead = 0;   // Marca de tiempo de la última lectura analógica/digital del DHT
-unsigned long lastLcdUpdate = 0;    // Marca de tiempo de la última actualización del frame LCD
+unsigned long lastWifiAttempt = 0;   // Marca de tiempo del último intento de enlace Wi-Fi
+unsigned long lastAlertAttempt = 0;  // Marca de tiempo del último despacho de notificación remota
+unsigned long lastSensorRead = 0;    // Marca de tiempo de la última adquisición del sensor
+unsigned long lastDisplayUpdate = 0; // Marca de tiempo de la última actualización gráfica
 
 // Banderas de control de estado
 bool wifiWasConnected = false;  // Registro de estado para detección de flancos en la conexión
@@ -86,7 +107,7 @@ float currentHumidity = NAN; // Última humedad relativa adquirida (%RH)
 /**
  * @brief Transmite un mensaje con formato Markdown hacia la API de Telegram y procesa el código de respuesta HTTP.
  *
- * @param temperature Valor numérico de temperatura que será interpolado en la cadena de notificación.
+ * @param temperature Valor numérico de temperatura reportado.
  * @return true Si el servidor remoto respondió con código HTTP 200 (OK).
  * @return false En caso de falla de socket, timeout o código HTTP divergente de 200.
  */
@@ -101,12 +122,12 @@ bool sendTelegramAlert(float temperature)
   message += "Límite Excedido: " + String(TEMP_LIMIT) + "°C\n";
   message += "Ubicación: Sala";
 
-  // Formateo del URI y serialización URL-encoded para los parámetros GET/POST
+  // Formateo del URI y serialización URL-encoded para los parámetros
   String url = "https://" + String(telegramHost) + "/bot" + botToken + "/sendMessage";
   String payload = "chat_id=" + String(chatId) + "&text=" + urlEncode(message) + "&parse_mode=Markdown";
 
   HTTPClient http;
-  http.setTimeout(5000); // Límite de espera de 5 segundos para prevenir bloqueos de pila
+  http.setTimeout(5000); // Límite de espera de 5 segundos
 
   if (!http.begin(secureClient, url))
   {
@@ -186,15 +207,90 @@ bool sendWhatsAppAlert(float temperature)
 }
 
 /**
- * @brief Actualiza las líneas del display LCD 1602 con formato estructurado de ancho fijo.
+ * @brief Renderiza el cuadro de telemetría y estado en la pantalla OLED de 128x64 píxeles.
  *
- * Se emplea snprintf con búferes estáticos de 17 bytes (16 caracteres + null terminator)
- * para asegurar que las posiciones previas se sobreescriban sin requerir llamadas costosas
- * a lcd.clear(), evitando el parpadeo del panel óptico.
+ * Distribución del lienzo:
+ *   - Encabezado: Barra superior con estado Wi-Fi y Alarma.
+ *   - Zona central: Lectura destacada de Temperatura y Humedad.
+ *   - Pie de pantalla: IP asignada o indicador de desconexión.
  *
  * @param temp Valor instantáneo de temperatura (°C).
  * @param hum Valor instantáneo de humedad relativa (%).
  */
+void updateOLED(float temp, float hum)
+{
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // --- 1. Encabezado de Estado (Y: 0 a 10) ---
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    display.print("WiFi: OK");
+  }
+  else
+  {
+    display.print("WiFi: --");
+  }
+
+  // Indicador de Alarma alineado a la derecha
+  if (alarmActive)
+  {
+    display.setCursor(76, 0);
+    display.print("[ALERTA]");
+  }
+  else
+  {
+    display.setCursor(82, 0);
+    display.print("[NORM]");
+  }
+
+  // Línea divisoria horizontal decorativa
+  display.drawFastHLine(0, 11, SCREEN_WIDTH, SSD1306_WHITE);
+
+  // --- 2. Despliegue de Variables (Y: 16 a 44) ---
+  if (isnan(temp) || isnan(hum))
+  {
+    display.setTextSize(1);
+    display.setCursor(18, 25);
+    display.print("ERROR EN SENSOR");
+  }
+  else
+  {
+    // Temperatura en fuente aumentada
+    display.setTextSize(2);
+    display.setCursor(4, 18);
+    display.printf("%4.1f C", temp);
+
+    // Humedad relativa
+    display.setTextSize(1);
+    display.setCursor(6, 38);
+    display.printf("Humedad: %.0f %%", hum);
+  }
+
+  // Línea divisoria inferior
+  display.drawFastHLine(0, 50, SCREEN_WIDTH, SSD1306_WHITE);
+
+  // --- 3. Barra de Información Inferior (Y: 54) ---
+  display.setTextSize(1);
+  display.setCursor(0, 54);
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    display.print(WiFi.localIP().toString());
+  }
+  else
+  {
+    display.print("Sin IP asignada");
+  }
+
+  // Transferencia de memoria de video (framebuffer) al controlador SSD1306 vía I2C
+  display.display();
+}
+
+/* ============================================================================
+   FUNCIÓN DESACTIVADA: ACTUALIZACIÓN DE PANTALLA LCD 1602 I2C
+   ============================================================================
 void updateLCD(float temp, float hum)
 {
   char line0[17];
@@ -207,7 +303,6 @@ void updateLCD(float temp, float hum)
   }
   else
   {
-    // Formato con punto decimal y longitud fija para estabilizar la posición visual
     snprintf(line0, sizeof(line0), "T:%4.1fC  H:%3.0f%%", temp, hum);
   }
 
@@ -216,12 +311,12 @@ void updateLCD(float temp, float hum)
   const char *alarmState = alarmActive ? "ALARM!" : "NORM  ";
   snprintf(line1, sizeof(line1), "%-6s  %-7s", wifiState, alarmState);
 
-  // Escritura sobre la memoria DDRAM del controlador HD44780
   lcd.setCursor(0, 0);
   lcd.print(line0);
   lcd.setCursor(0, 1);
   lcd.print(line1);
 }
+============================================================================ */
 
 // ============================================================================
 // CONFIGURACIÓN INICIAL DEL SISTEMA (SETUP)
@@ -231,13 +326,33 @@ void setup()
   // Inicialización de la consola serie para trazabilidad y depuración de eventos
   Serial.begin(115200);
 
-  // Configuración del bus serie I2C e inicialización de la pantalla alfanumérica
+  // Configuración del bus serie I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // Inicialización del panel OLED SSD1306 con bomba de carga interna habilitada (SSD1306_SWITCHCAPVCC)
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR))
+  {
+    Serial.println("[ERROR] No se detectó la pantalla OLED SSD1306 en la dirección I2C configurada.");
+  }
+  else
+  {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(10, 20);
+    display.print("Iniciando nodo...");
+    display.setCursor(10, 36);
+    display.print("Sensor DHT11 / WiFi");
+    display.display();
+  }
+
+  /* --- Inicialización de pantalla LCD 1602 desactivada ---
   lcd.init();
   lcd.backlight();
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Iniciando nodo..");
+  */
 
   // Arranque del circuito de muestreo del DHT11
   dht.begin();
@@ -350,11 +465,15 @@ void loop()
   }
 
   // --------------------------------------------------------------------------
-  // TAREA 3: ACTUALIZACIÓN PERIÓDICA DEL DISPLAY LCD I2C
+  // TAREA 3: ACTUALIZACIÓN PERIÓDICA DEL DISPLAY OLED (128x64)
   // --------------------------------------------------------------------------
-  if (now - lastLcdUpdate >= LCD_INTERVAL_MS)
+  if (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS)
   {
-    lastLcdUpdate = now;
+    lastDisplayUpdate = now;
+    updateOLED(currentTemp, currentHumidity);
+
+    /* --- Llamado LCD 1602 Desactivado ---
     updateLCD(currentTemp, currentHumidity);
+    */
   }
 }
