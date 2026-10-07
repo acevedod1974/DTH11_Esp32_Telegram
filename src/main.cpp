@@ -29,14 +29,17 @@
 #include <DHT.h>              // Librería Adafruit para adquisición de datos DHT
 #include <Wire.h>             // Driver del bus serie síncrono I2C (Two-Wire Interface)
 
-// Librerías de la pantalla OLED activa (SSD1306)
+// ============================================================================
+// SELECTOR DE PANTALLA: 1 = OLED SSD1306 128x64 | 0 = LCD 1602 I2C (PCF8574)
+// ============================================================================
+#define USE_OLED 1
+
+#if USE_OLED
 #include <Adafruit_GFX.h>     // Primitivas gráficas del ecosistema Adafruit
 #include <Adafruit_SSD1306.h> // Controlador de hardware para paneles OLED SSD1306
-
-/* ============================================================================
-   LIBRERÍA DESACTIVADA: PANTALLA LCD 1602 I2C
-   ============================================================================ */
-// #include <LiquidCrystal_I2C.h> // Controlador para pantallas LCD basadas en HD44780 + PCF8574
+#else
+#include <LiquidCrystal_I2C.h> // Controlador para pantallas LCD basadas en HD44780 + PCF8574
+#endif
 
 #include "secrets.h" // Credenciales de red (SSID/PASS) y tokens privados
 
@@ -48,17 +51,16 @@
 #define I2C_SDA_PIN 21 // Pin GPIO asignado a la línea de datos serie I2C
 #define I2C_SCL_PIN 22 // Pin GPIO asignado a la línea de reloj serie I2C
 
-// --- Configuración OLED Activa ---
+#if USE_OLED
 #define SCREEN_WIDTH 128   // Ancho del panel OLED en píxeles
 #define SCREEN_HEIGHT 64   // Alto del panel OLED en píxeles
 #define OLED_RESET -1      // Reset compartido con el ESP32 (-1 indica que no hay pin dedicado)
 #define OLED_I2C_ADDR 0x3C // Dirección I2C de 7 bits (0x78 en escritura de 8 bits equivale a 0x3C)
-
-/* --- Configuración LCD 1602 Desactivada ---
+#else
 #define LCD_I2C_ADDR 0x27 // Dirección física del módulo expansor PCF8574
 #define LCD_COLUMNS 16    // Capacidad horizontal del display (caracteres)
 #define LCD_ROWS 2        // Capacidad vertical del display (líneas)
-*/
+#endif
 
 // ============================================================================
 // PARÁMETROS OPERATIVOS Y CONTROL DE TIEMPOS (MILLIS)
@@ -80,12 +82,13 @@ const int httpsPort = 443;                     // Puerto estándar para transpor
 // INSTANCIACIÓN DE OBJETOS GLOBALES Y VARIABLES DE ESTADO
 // ============================================================================
 DHT dht(DHTPIN, DHTTYPE);                                                 // Instancia del transductor DHT11
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // Instancia del panel OLED SSD1306
 WiFiClientSecure secureClient;                                            // Cliente TLS/SSL reutilizable para peticiones seguras
 
-/* --- Instancia LCD 1602 Desactivada ---
+#if USE_OLED
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // Instancia del panel OLED SSD1306
+#else
 LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLUMNS, LCD_ROWS);
-*/
+#endif
 
 // Timers para la gestión no bloqueante de tareas
 unsigned long lastWifiAttempt = 0;   // Marca de tiempo del último intento de enlace Wi-Fi
@@ -217,6 +220,7 @@ bool sendWhatsAppAlert(float temperature)
  * @param temp Valor instantáneo de temperatura (°C).
  * @param hum Valor instantáneo de humedad relativa (%).
  */
+#if USE_OLED
 void updateOLED(float temp, float hum)
 {
   display.clearDisplay();
@@ -287,10 +291,7 @@ void updateOLED(float temp, float hum)
   // Transferencia de memoria de video (framebuffer) al controlador SSD1306 vía I2C
   display.display();
 }
-
-/* ============================================================================
-   FUNCIÓN DESACTIVADA: ACTUALIZACIÓN DE PANTALLA LCD 1602 I2C
-   ============================================================================
+#else
 void updateLCD(float temp, float hum)
 {
   char line0[17];
@@ -316,7 +317,7 @@ void updateLCD(float temp, float hum)
   lcd.setCursor(0, 1);
   lcd.print(line1);
 }
-============================================================================ */
+#endif
 
 // ============================================================================
 // CONFIGURACIÓN INICIAL DEL SISTEMA (SETUP)
@@ -329,6 +330,7 @@ void setup()
   // Configuración del bus serie I2C
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
+#if USE_OLED
   // Inicialización del panel OLED SSD1306 con bomba de carga interna habilitada (SSD1306_SWITCHCAPVCC)
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR))
   {
@@ -345,14 +347,13 @@ void setup()
     display.print("Sensor DHT11 / WiFi");
     display.display();
   }
-
-  /* --- Inicialización de pantalla LCD 1602 desactivada ---
+#else
   lcd.init();
   lcd.backlight();
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("Iniciando nodo..");
-  */
+#endif
 
   // Arranque del circuito de muestreo del DHT11
   dht.begin();
@@ -470,10 +471,10 @@ void loop()
   if (now - lastDisplayUpdate >= DISPLAY_INTERVAL_MS)
   {
     lastDisplayUpdate = now;
+#if USE_OLED
     updateOLED(currentTemp, currentHumidity);
-
-    /* --- Llamado LCD 1602 Desactivado ---
+#else
     updateLCD(currentTemp, currentHumidity);
-    */
+#endif
   }
 }
